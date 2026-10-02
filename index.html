@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>VR Pot Smash</title>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background-color: #111; 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+        }
+        #info-panel {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(20, 20, 20, 0.85);
+            padding: 30px;
+            border-radius: 16px;
+            color: #fff;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            pointer-events: none;
+            transition: opacity 0.5s;
+            z-index: 10;
+        }
+        h1 { margin-top: 0; font-size: 24px; font-weight: 600; }
+        p { color: #ccc; line-height: 1.6; margin-bottom: 20px; }
+        .tag { display: inline-block; background: #e74c3c; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; margin-bottom: 10px; }
+        /* Three.js VR Button overrides */
+        #VRButton {
+            pointer-events: auto;
+            border-radius: 8px !important;
+            border: none !important;
+            background: #fff !important;
+            color: #000 !important;
+            font-weight: bold !important;
+            padding: 12px 24px !important;
+        }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.150.1/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.150.1/examples/jsm/",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+</head>
+<body>
+    <div id="info-panel">
+        <div class="tag">WebXR Ready</div>
+        <h1>植木鉢クラッシュVR</h1>
+        <p>VRヘッドセットを装着し、「Enter VR」をクリックしてください。<br>コントローラーのグリップ（またはトリガー）ボタンで<br>目の前にある植木鉢を掴み、力強く壁に投げつけて割りましょう。</p>
+        <p style="font-size: 0.8em; color: #888;">※VR環境がない場合はブラウザのみで3D空間を確認できます。</p>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import * as CANNON from 'cannon-es';
+
+        // --- Core Variables ---
+        let scene, camera, renderer;
+        let world;
+        let clock = new THREE.Clock();
+        
+        // Interaction variables
+        let controller1, controller2;
+        let grabbedBy = null;
+        let grabLocalOffset = new THREE.Matrix4();
+        const controllersData = new Map();
+
+        // Audio
+        let audioCtx;
+
+        // Pot Variables
+        let potGroup, potMesh, potBody;
+        let isBroken = false;
+        let shards = [];
+        let potMaterial, dirtMaterial, plantMaterial;
+        let potGeo;
+
+        // Physics Materials
+        let physicsMaterial;
+
+        init();
+        setupPhysics();
+        createEnvironment();
+        createProceduralAssets();
+        spawnPot();
+        setupControllers();
+        
+        function init() {
+            const container = document.createElement( 'div' );
+            document.body.appendChild( container );
+
+            // Scene setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color( 0x1a1a1a );
+            scene.fog = new THREE.Fog( 0x1a1a1a, 2, 10 );
+
+            // Camera setup
+            camera = new THREE.PerspectiveCamera( 70, window.innerWidth / window.innerHeight, 0.1, 20 );
+            camera.position.set(0, 1.6, 1);
+
+            // Lighting for Realism
+            const ambientLight = new THREE.AmbientLight( 0xffffff, 0.6 );
+            scene.add( ambientLight );
+
+            const dirLight = new THREE.DirectionalLight( 0xffffee, 2.0 );
+            dirLight.position.set( 3, 5, 2 );
+            dirLight.castShadow = true;
+            dirLight.shadow.mapSize.width = 2048;
+            dirLight.shadow.mapSize.height = 2048;
+            dirLight.shadow.camera.near = 0.1;
+            dirLight.shadow.camera.far = 15;
+            scene.add( dirLight );
+
+            // Renderer setup
+            renderer = new THREE.WebGLRenderer( { antialias: true } );
+            renderer.setPixelRatio( window.devicePixelRatio );
+            renderer.setSize( window.innerWidth, window.innerHeight );
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            renderer.xr.enabled = true;
+            container.appendChild( renderer.domElement );
+
+            // Add VR Button
+            const vrButton = VRButton.createButton( renderer );
+            document.body.appendChild( vrButton );
+
+            // Hide info panel when entering VR
+            renderer.xr.addEventListener('sessionstart', () => {
+                document.getElementById('info-panel').style.opacity = '0';
+                initAudio();
+            });
+            renderer.xr.addEventListener('sessionend', () => {
+                document.getElementById('info-panel').style.opacity = '1';
+            });
+
+            window.addEventListener( 'resize', onWindowResize );
+        }
+
+        function setupPhysics() {
+            world = new CANNON.World();
+            world.gravity.set(0, -9.81, 0); // Earth gravity
+            world.broadphase = new CANNON.NaiveBroadphase();
+            world.solver.iterations = 10;
+
+            // Global contact material to add some friction
+            physicsMaterial = new CANNON.Material('standard');
+            const physicsContactMaterial = new CANNON.ContactMaterial(
+                physicsMaterial, physicsMaterial,
+                { friction: 0.6, restitution: 0.1 }
+            );
+            world.addContactMaterial(physicsContactMaterial);
+        }
+
+        function createProceduralAssets() {
+            // 1. Terracotta (Pot) Texture & Bump Map
+            const canvas = document.createElement('canvas');
+            canvas.width = 512; canvas.height = 512;
+            const ctx = canvas.getContext('2d');
+            
+            const bumpCanvas = document.createElement('canvas');
+            bumpCanvas.width = 512; bumpCanvas.height = 512;
+            const bctx = bumpCanvas.getContext('2d');
+
+            // Base colors
+            ctx.fillStyle = '#b75c3d'; // Rich terracotta orange/brown
+            ctx.fillRect(0, 0, 512, 512);
+            bctx.fillStyle = '#808080';
+            bctx.fillRect(0, 0, 512, 512);
+
+            // Add clay noise and imperfections
+            for(let i=0; i<40000; i++) {
+                const x = Math.random() * 512;
+                const y = Math.random() * 512;
+                const v = Math.random();
+                const r = Math.random() * 2;
+                
+                // Color variation
+                ctx.fillStyle = v > 0.5 ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.08)';
+                ctx.beginPath();
+                ctx.arc(x, y, r, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Bump map variation (height differences)
+                const bv = Math.floor(128 + (v - 0.5) * 80);
+                bctx.fillStyle = `rgb(${bv},${bv},${bv})`;
+                bctx.beginPath();
+                bctx.arc(x, y, r, 0, Math.PI * 2);
+                bctx.fill();
+            }
+
+            const colorTex = new THREE.CanvasTexture(canvas);
+            const bumpTex = new THREE.CanvasTexture(bumpCanvas);
+
+            potMaterial = new THREE.MeshStandardMaterial({
+                map: colorTex,
+                bumpMap: bumpTex,
+                bumpScale: 0.03,
+                roughness: 0.95, // Clay is very rough
+                metalness: 0.05
+            });
+
+            // 2. High-quality Pot Geometry (Lathe)
+            const points = [];
+            points.push(new THREE.Vector2(0.00, 0.0)); // bottom center
+            points.push(new THREE.Vector2(0.12, 0.0)); // bottom edge
+            points.push(new THREE.Vector2(0.14, 0.05)); // base curve
+            points.push(new THREE.Vector2(0.17, 0.20)); // middle swell
+            points.push(new THREE.Vector2(0.18, 0.35)); // upper neck
+            points.push(new THREE.Vector2(0.20, 0.40)); // rim outer
+            points.push(new THREE.Vector2(0.18, 0.40)); // rim inner
+            points.push(new THREE.Vector2(0.16, 0.35)); // inner neck
+            points.push(new THREE.Vector2(0.15, 0.20)); // inner swell
+            points.push(new THREE.Vector2(0.12, 0.02)); // inner base
+            points.push(new THREE.Vector2(0.00, 0.02)); // inner bottom center
+
+            potGeo = new THREE.LatheGeometry(points, 64);
+            // Center geometry to make physics syncing easier
+            potGeo.translate(0, -0.2, 0); 
+            
+            // --- NEW: Dirt and Plant Materials ---
+            // 土のマテリアル
+            dirtMaterial = new THREE.MeshStandardMaterial({
+                color: 0x2b1c10, // ダークブラウン
+                roughness: 1.0,
+                bumpMap: bumpTex, // テクスチャのノイズを流用して凸凹に
+                bumpScale: 0.06
+            });
+
+            // 植物のマテリアル
+            plantMaterial = new THREE.MeshStandardMaterial({
+                color: 0x3e7a3e, // 落ち着いた緑
+                roughness: 0.7,
+                side: THREE.DoubleSide
+            });
+        }
+
+        // 植物の3Dモデルをプロシージャルに生成する関数
+        function buildPlantVisual() {
+            const group = new THREE.Group();
+            
+            // 茎1
+            const stem1Geo = new THREE.CylinderGeometry(0.008, 0.015, 0.4, 8);
+            stem1Geo.translate(0, 0.2, 0); // 原点を下部に
+            const stem1 = new THREE.Mesh(stem1Geo, plantMaterial);
+            stem1.castShadow = true;
+            stem1.rotation.z = 0.1;
+            group.add(stem1);
+
+            // 茎2
+            const stem2Geo = new THREE.CylinderGeometry(0.006, 0.01, 0.3, 8);
+            stem2Geo.translate(0, 0.15, 0);
+            const stem2 = new THREE.Mesh(stem2Geo, plantMaterial);
+            stem2.castShadow = true;
+            stem2.rotation.z = -0.15;
+            stem2.rotation.x = 0.1;
+            group.add(stem2);
+
+            // 葉
+            const leafGeo = new THREE.SphereGeometry(0.06, 8, 8);
+            leafGeo.scale(1, 0.1, 2.5); // 平たく引き伸ばす
+            leafGeo.translate(0, 0, 0.08); // 原点を端に
+            
+            const addLeaves = (stem, count, heightRange) => {
+                for(let i=0; i<count; i++) {
+                    const leaf = new THREE.Mesh(leafGeo, plantMaterial);
+                    leaf.castShadow = true;
+                    const h = heightRange[0] + Math.random() * (heightRange[1] - heightRange[0]);
+                    leaf.position.set(0, h, 0);
+                    leaf.rotation.y = (Math.PI * 2 / count) * i + Math.random() * 0.5;
+                    leaf.rotation.x = Math.PI / 4 + Math.random() * 0.2;
+                    stem.add(leaf);
+                }
+            };
+
+            addLeaves(stem1, 12, [0.1, 0.35]); // メインの茎に葉を配置
+            addLeaves(stem2, 8, [0.05, 0.25]); // サブの茎に葉を配置
+
+            return group;
+        }
+
+        function createEnvironment() {
+            // Floor
+            const floorGeo = new THREE.PlaneGeometry(20, 20);
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+            const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+            floorMesh.rotation.x = -Math.PI / 2;
+            floorMesh.receiveShadow = true;
+            scene.add(floorMesh);
+
+            const floorBody = new CANNON.Body({
+                mass: 0, // static
+                shape: new CANNON.Plane(),
+                material: physicsMaterial
+            });
+            floorBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+            world.addBody(floorBody);
+
+            // Wall (The target)
+            const wallGeo = new THREE.BoxGeometry(10, 5, 0.5);
+            // Concrete-like texture
+            const wc = document.createElement('canvas');
+            wc.width = 512; wc.height = 512;
+            const wctx = wc.getContext('2d');
+            wctx.fillStyle = '#666'; wctx.fillRect(0,0,512,512);
+            for(let i=0; i<10000; i++) {
+                wctx.fillStyle = Math.random()>0.5?'rgba(0,0,0,0.1)':'rgba(255,255,255,0.1)';
+                wctx.fillRect(Math.random()*512, Math.random()*512, 4, 4);
+            }
+            const wallTex = new THREE.CanvasTexture(wc);
+            const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 0.9 });
+            const wallMesh = new THREE.Mesh(wallGeo, wallMat);
+            wallMesh.position.set(0, 2.5, -3);
+            wallMesh.receiveShadow = true;
+            scene.add(wallMesh);
+
+            const wallBody = new CANNON.Body({
+                mass: 0,
+                shape: new CANNON.Box(new CANNON.Vec3(5, 2.5, 0.25)),
+                material: physicsMaterial
+            });
+            wallBody.position.copy(wallMesh.position);
+            world.addBody(wallBody);
+
+            // Pedestal
+            const pedGeo = new THREE.CylinderGeometry(0.2, 0.2, 0.8, 32);
+            const pedMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6 });
+            const pedMesh = new THREE.Mesh(pedGeo, pedMat);
+            pedMesh.position.set(0, 0.4, -0.6); // 0.8 height total
+            pedMesh.receiveShadow = true;
+            pedMesh.castShadow = true;
+            scene.add(pedMesh);
+
+            const pedBody = new CANNON.Body({
+                mass: 0,
+                shape: new CANNON.Cylinder(0.2, 0.2, 0.8, 16),
+                material: physicsMaterial
+            });
+            // Rotate CANNON Cylinder to match Three.js (which defaults to Y axis)
+            const cq = new CANNON.Quaternion();
+            cq.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2);
+            pedBody.addShape(new CANNON.Cylinder(0.2, 0.2, 0.8, 16), new CANNON.Vec3(0,0,0), cq);
+            pedBody.position.copy(pedMesh.position);
+            world.addBody(pedBody);
+        }
+
+        function spawnPot() {
+            cleanUpShards();
+            isBroken = false;
+            grabbedBy = null;
+
+            if (potGroup) {
+                scene.remove(potGroup);
+                world.removeBody(potBody);
+            }
+
+            // まとめて物理同期するためのグループ
+            potGroup = new THREE.Group();
+            potGroup.position.set(0, 1.0, -0.6); // Slightly above pedestal
+            scene.add(potGroup);
+
+            // Visual Mesh (鉢)
+            potMesh = new THREE.Mesh(potGeo, potMaterial);
+            potMesh.castShadow = true;
+            potMesh.receiveShadow = true;
+            potGroup.add(potMesh);
+
+            // Visual Mesh (土)
+            const dirtGeo = new THREE.CylinderGeometry(0.16, 0.14, 0.04, 16);
+            const dirtMesh = new THREE.Mesh(dirtGeo, dirtMaterial);
+            dirtMesh.position.set(0, 0.18, 0); // 鉢の内側上部へ
+            potGroup.add(dirtMesh);
+
+            // Visual Mesh (植物)
+            const plantMesh = buildPlantVisual();
+            plantMesh.position.set(0, 0.2, 0); // 土のすぐ上
+            potGroup.add(plantMesh);
+
+            // Physics Body (衝突判定は鉢全体の円柱で近似)
+            potBody = new CANNON.Body({
+                mass: 2.5, // 2.5kg feels good
+                material: physicsMaterial,
+                linearDamping: 0.1,
+                angularDamping: 0.1
+            });
+            // Use a cylinder for the pot collision shape
+            const potShape = new CANNON.Cylinder(0.2, 0.12, 0.4, 16);
+            const cq = new CANNON.Quaternion();
+            cq.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2);
+            potBody.addShape(potShape, new CANNON.Vec3(0, 0, 0), cq);
+            potBody.position.copy(potGroup.position);
+            
+            // Listen for hard collisions
+            potBody.addEventListener('collide', handleCollision);
+            world.addBody(potBody);
+        }
+
+        function cleanUpShards() {
+            shards.forEach(s => {
+                scene.remove(s.mesh);
+                world.removeBody(s.body);
+            });
+            shards = [];
+        }
+
+        function setupControllers() {
+            const controllerModelGeo = new THREE.BoxGeometry(0.04, 0.04, 0.1);
+            const controllerModelMat = new THREE.MeshStandardMaterial({color: 0x666666, roughness: 0.2});
+
+            controller1 = renderer.xr.getController( 0 );
+            const hand1 = new THREE.Mesh(controllerModelGeo, controllerModelMat);
+            controller1.add(hand1);
+            scene.add( controller1 );
+
+            controller2 = renderer.xr.getController( 1 );
+            const hand2 = new THREE.Mesh(controllerModelGeo, controllerModelMat);
+            controller2.add(hand2);
+            scene.add( controller2 );
+
+            const onGrabStart = (event) => {
+                const controller = event.target;
+                if(isBroken || grabbedBy) return;
+
+                const cPos = new THREE.Vector3();
+                controller.getWorldPosition(cPos);
+                const pPos = new THREE.Vector3();
+                potGroup.getWorldPosition(pPos);
+
+                // Check grab distance
+                if(cPos.distanceTo(pPos) < 0.25) {
+                    grabbedBy = controller;
+                    world.removeBody(potBody); // Remove from physics while held
+                    
+                    // Calculate offset so it stays exactly where it was grabbed
+                    const controllerInverse = new THREE.Matrix4().copy(controller.matrixWorld).invert();
+                    grabLocalOffset.multiplyMatrices(controllerInverse, potGroup.matrixWorld);
+                    triggerHaptic(controller, 0.3, 50); // Feedback on grab
+                }
+            };
+
+            const onGrabEnd = (event) => {
+                const controller = event.target;
+                if(grabbedBy === controller) {
+                    grabbedBy = null;
+                    
+                    // Update physics body to drop location
+                    potBody.position.copy(potGroup.position);
+                    potBody.quaternion.copy(potGroup.quaternion);
+                    world.addBody(potBody);
+
+                    // Impart throw velocity
+                    const v = getControllerVelocity(controller);
+                    // Multiply velocity to make throwing in VR feel more natural/powerful
+                    potBody.velocity.set(v.x * 1.8, v.y * 1.8, v.z * 1.8);
+                    
+                    // Random spin
+                    potBody.angularVelocity.set(
+                        (Math.random()-0.5)*10,
+                        (Math.random()-0.5)*10,
+                        (Math.random()-0.5)*10
+                    );
+                }
+            };
+
+            // Listen to both trigger and grip for maximum compatibility
+            controller1.addEventListener( 'selectstart', onGrabStart );
+            controller1.addEventListener( 'selectend', onGrabEnd );
+            controller1.addEventListener( 'squeezestart', onGrabStart );
+            controller1.addEventListener( 'squeezeend', onGrabEnd );
+
+            controller2.addEventListener( 'selectstart', onGrabStart );
+            controller2.addEventListener( 'selectend', onGrabEnd );
+            controller2.addEventListener( 'squeezestart', onGrabStart );
+            controller2.addEventListener( 'squeezeend', onGrabEnd );
+        }
+
+        // Keep track of controller speeds for throwing
+        function updateControllersVelocity(dt) {
+            [controller1, controller2].forEach(c => {
+                if(!c) return;
+                if(!controllersData.has(c)) {
+                    controllersData.set(c, { positions: [], velocities: [] });
+                }
+                const data = controllersData.get(c);
+                const pos = new THREE.Vector3();
+                c.getWorldPosition(pos);
+                
+                if(data.positions.length > 0) {
+                    const lastPos = data.positions[data.positions.length - 1];
+                    // Prevent division by zero
+                    if(dt > 0) {
+                        const v = new THREE.Vector3().subVectors(pos, lastPos).divideScalar(dt);
+                        data.velocities.push(v);
+                    }
+                }
+                data.positions.push(pos);
+                
+                // Keep history small to calculate recent average
+                if(data.positions.length > 4) data.positions.shift();
+                if(data.velocities.length > 3) data.velocities.shift();
+            });
+        }
+
+        function getControllerVelocity(c) {
+            const data = controllersData.get(c);
+            if(!data || data.velocities.length === 0) return new THREE.Vector3(0,0,0);
+            const avg = new THREE.Vector3();
+            data.velocities.forEach(v => avg.add(v));
+            avg.divideScalar(data.velocities.length);
+            return avg;
+        }
+
+        function triggerHaptic(controller, intensity, duration) {
+            // Haptic feedback if available
+            const session = renderer.xr.getSession();
+            if (session && session.inputSources) {
+                // Find matching input source
+                for(let source of session.inputSources) {
+                    if (source.handedness === 'left' || source.handedness === 'right') { // Simple check
+                        if (source.gamepad && source.gamepad.hapticActuators && source.gamepad.hapticActuators.length > 0) {
+                            try {
+                                source.gamepad.hapticActuators[0].pulse(intensity, duration);
+                            } catch (e) { /* ignore unsupported */ }
+                        }
+                    }
+                }
+            }
+        }
+
+        function handleCollision(e) {
+            if(isBroken || grabbedBy) return;
+            const velocityAlongNormal = e.contact.getImpactVelocityAlongNormal();
+            
+            // If hit hard enough (absolute velocity > 3)
+            if (Math.abs(velocityAlongNormal) > 3.0) {
+                shatter(potBody.position, potBody.velocity);
+            } else if (Math.abs(velocityAlongNormal) > 1.0) {
+                // Light tap sound
+                playClinkSound();
+            }
+        }
+
+        function shatter(originPos, impactVelocity) {
+            isBroken = true;
+            world.removeBody(potBody);
+            potGroup.visible = false;
+
+            playCrashSound();
+            
+            // Haptic rumble on both controllers on big crash
+            triggerHaptic(controller1, 1.0, 150);
+            triggerHaptic(controller2, 1.0, 150);
+
+            // Generate shards (approx 35 pieces)
+            const numShards = 35;
+            for(let i=0; i<numShards; i++) {
+                // Irregular shard geometry
+                const sGeo = new THREE.TetrahedronGeometry(Math.random() * 0.05 + 0.02);
+                const posArr = sGeo.attributes.position;
+                for(let j=0; j<posArr.count; j++) {
+                    posArr.setXYZ(j,
+                        posArr.getX(j) * (0.6 + Math.random()),
+                        posArr.getY(j) * (0.6 + Math.random()),
+                        posArr.getZ(j) * (0.6 + Math.random())
+                    );
+                }
+                sGeo.computeVertexNormals();
+
+                const sMesh = new THREE.Mesh(sGeo, potMaterial);
+                sMesh.castShadow = true;
+                sMesh.receiveShadow = true;
+                
+                // Distribute slightly around center
+                sMesh.position.copy(originPos);
+                sMesh.position.x += (Math.random() - 0.5) * 0.2;
+                sMesh.position.y += (Math.random() - 0.5) * 0.3;
+                sMesh.position.z += (Math.random() - 0.5) * 0.2;
+                scene.add(sMesh);
+
+                // Simple sphere physics for shards for performance
+                const sBody = new CANNON.Body({
+                    mass: 0.05,
+                    shape: new CANNON.Sphere(0.04),
+                    material: physicsMaterial
+                });
+                sBody.position.copy(sMesh.position);
+                
+                // Explosive outward velocity + inherited throw velocity
+                const explodeForce = 2 + Math.random() * 4;
+                sBody.velocity.set(
+                    (impactVelocity.x * 0.3) + (Math.random() - 0.5) * explodeForce,
+                    (impactVelocity.y * 0.3) + (Math.random()) * explodeForce,
+                    (impactVelocity.z * 0.3) + (Math.random() - 0.5) * explodeForce
+                );
+                sBody.angularVelocity.set(
+                    (Math.random()-0.5)*20,
+                    (Math.random()-0.5)*20,
+                    (Math.random()-0.5)*20
+                );
+
+                world.addBody(sBody);
+                shards.push({ mesh: sMesh, body: sBody });
+            }
+
+            // --- 飛び散る土塊 ---
+            for(let i=0; i<20; i++) {
+                const dGeo = new THREE.TetrahedronGeometry(Math.random() * 0.03 + 0.01);
+                const dMesh = new THREE.Mesh(dGeo, dirtMaterial);
+                dMesh.castShadow = true;
+                dMesh.position.copy(originPos);
+                dMesh.position.y += 0.2 + (Math.random() * 0.1); // 土の高さから
+                dMesh.position.x += (Math.random() - 0.5) * 0.2;
+                dMesh.position.z += (Math.random() - 0.5) * 0.2;
+                scene.add(dMesh);
+
+                const dBody = new CANNON.Body({
+                    mass: 0.02,
+                    shape: new CANNON.Sphere(0.02),
+                    material: physicsMaterial
+                });
+                dBody.position.copy(dMesh.position);
+                const explodeForce = 1 + Math.random() * 3;
+                dBody.velocity.set(
+                    (impactVelocity.x * 0.4) + (Math.random() - 0.5) * explodeForce,
+                    (impactVelocity.y * 0.4) + (Math.random()) * explodeForce,
+                    (impactVelocity.z * 0.4) + (Math.random() - 0.5) * explodeForce
+                );
+                world.addBody(dBody);
+                shards.push({ mesh: dMesh, body: dBody }); // ゴミ回収配列を流用
+            }
+
+            // --- 吹き飛ぶ植物 ---
+            const pMesh = buildPlantVisual();
+            pMesh.castShadow = true;
+            pMesh.position.copy(originPos);
+            pMesh.position.y += 0.2;
+            scene.add(pMesh);
+
+            const pBody = new CANNON.Body({
+                mass: 0.1,
+                material: physicsMaterial
+            });
+            const pCq = new CANNON.Quaternion();
+            pCq.setFromAxisAngle(new CANNON.Vec3(1,0,0), -Math.PI/2);
+            // 植物の衝突範囲を大まかな円柱で近似
+            pBody.addShape(new CANNON.Cylinder(0.1, 0.1, 0.4, 8), new CANNON.Vec3(0, 0.2, 0), pCq);
+            pBody.position.copy(pMesh.position);
+            
+            pBody.velocity.set(
+                (impactVelocity.x * 0.6) + (Math.random() - 0.5) * 2,
+                (impactVelocity.y * 0.6) + Math.random() * 2,
+                (impactVelocity.z * 0.6) + (Math.random() - 0.5) * 2
+            );
+            pBody.angularVelocity.set((Math.random()-0.5)*5, (Math.random()-0.5)*5, (Math.random()-0.5)*5);
+            world.addBody(pBody);
+            shards.push({ mesh: pMesh, body: pBody });
+
+            // Respawn a new pot after 4 seconds
+            setTimeout(spawnPot, 4000);
+        }
+
+        function initAudio() {
+            if(!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            } else if(audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+        }
+
+        function playCrashSound() {
+            if(!audioCtx || audioCtx.state !== 'running') return;
+            const t = audioCtx.currentTime;
+
+            // 1. Bass Thump (Impact)
+            const osc = audioCtx.createOscillator();
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(100, t);
+            osc.frequency.exponentialRampToValueAtTime(20, t + 0.15);
+            const gainOsc = audioCtx.createGain();
+            gainOsc.gain.setValueAtTime(1.5, t);
+            gainOsc.gain.exponentialRampToValueAtTime(0.01, t + 0.15);
+            osc.connect(gainOsc).connect(audioCtx.destination);
+            osc.start(t);
+            osc.stop(t + 0.15);
+
+            // 2. High Frequency Crash Noise (Ceramic Breaking)
+            const bufferSize = audioCtx.sampleRate * 0.6; // 0.6 seconds
+            const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+            const data = buffer.getChannelData(0);
+            for(let i = 0; i < bufferSize; i++) {
+                // Exponential decay on noise envelope
+                data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.08));
+            }
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buffer;
+            
+            // Filter out low end of noise
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'highpass';
+            filter.frequency.value = 1200;
+            
+            const gainNoise = audioCtx.createGain();
+            gainNoise.gain.setValueAtTime(1.2, t);
+            gainNoise.gain.exponentialRampToValueAtTime(0.01, t + 0.5);
+            
+            noise.connect(filter).connect(gainNoise).connect(audioCtx.destination);
+            noise.start(t);
+        }
+
+        function playClinkSound() {
+            if(!audioCtx || audioCtx.state !== 'running') return;
+            const t = audioCtx.currentTime;
+            const osc = audioCtx.createOscillator();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(800, t);
+            osc.frequency.exponentialRampToValueAtTime(300, t + 0.05);
+            const gain = audioCtx.createGain();
+            gain.gain.setValueAtTime(0.2, t);
+            gain.gain.exponentialRampToValueAtTime(0.01, t + 0.05);
+            osc.connect(gain).connect(audioCtx.destination);
+            osc.start(t);
+            osc.stop(t + 0.05);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize( window.innerWidth, window.innerHeight );
+        }
+
+        renderer.setAnimationLoop( function () {
+            const dt = Math.min(clock.getDelta(), 0.1); // cap dt
+            
+            // Step Physics
+            world.step(1 / 60, dt, 3);
+
+            // Update hand velocities
+            updateControllersVelocity(dt);
+
+            // Synchronize Three.js visual objects with Cannon.js bodies
+            if(grabbedBy && !isBroken) {
+                // If held, pot strictly follows controller + offset
+                const targetMat = new THREE.Matrix4().multiplyMatrices(grabbedBy.matrixWorld, grabLocalOffset);
+                targetMat.decompose(potGroup.position, potGroup.quaternion, potGroup.scale);
+            } else if(!isBroken && potBody) {
+                // If free, visual strictly follows physics
+                potGroup.position.copy(potBody.position);
+                potGroup.quaternion.copy(potBody.quaternion);
+            }
+
+            // Sync Shards
+            if(isBroken) {
+                shards.forEach(s => {
+                    s.mesh.position.copy(s.body.position);
+                    s.mesh.quaternion.copy(s.body.quaternion);
+                });
+            }
+
+            renderer.render( scene, camera );
+        });
+    </script>
+</body>
+</html>
