@@ -63,6 +63,8 @@
     <script type="module">
         import * as THREE from 'three';
         import { VRButton } from 'three/addons/webxr/VRButton.js';
+        import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+        import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
         import * as CANNON from 'cannon-es';
 
         // --- Core Variables ---
@@ -72,6 +74,8 @@
         
         // Interaction variables
         let controller1, controller2;
+        let controllerGrip1, controllerGrip2;
+        let hand1, hand2;
         let grabbedBy = null;
         let grabLocalOffset = new THREE.Matrix4();
         const controllersData = new Map();
@@ -414,18 +418,28 @@
         }
 
         function setupControllers() {
-            const controllerModelGeo = new THREE.BoxGeometry(0.04, 0.04, 0.1);
-            const controllerModelMat = new THREE.MeshStandardMaterial({color: 0x666666, roughness: 0.2});
+            const controllerModelFactory = new XRControllerModelFactory();
+            const handModelFactory = new XRHandModelFactory();
 
+            // Controller 1
             controller1 = renderer.xr.getController( 0 );
-            const hand1 = new THREE.Mesh(controllerModelGeo, controllerModelMat);
-            controller1.add(hand1);
             scene.add( controller1 );
+            controllerGrip1 = renderer.xr.getControllerGrip( 0 );
+            controllerGrip1.add( controllerModelFactory.createControllerModel( controllerGrip1 ) );
+            scene.add( controllerGrip1 );
+            hand1 = renderer.xr.getHand( 0 );
+            hand1.add( handModelFactory.createHandModel( hand1, 'mesh' ) );
+            scene.add( hand1 );
 
+            // Controller 2
             controller2 = renderer.xr.getController( 1 );
-            const hand2 = new THREE.Mesh(controllerModelGeo, controllerModelMat);
-            controller2.add(hand2);
             scene.add( controller2 );
+            controllerGrip2 = renderer.xr.getControllerGrip( 1 );
+            controllerGrip2.add( controllerModelFactory.createControllerModel( controllerGrip2 ) );
+            scene.add( controllerGrip2 );
+            hand2 = renderer.xr.getHand( 1 );
+            hand2.add( handModelFactory.createHandModel( hand2, 'mesh' ) );
+            scene.add( hand2 );
 
             const onGrabStart = (event) => {
                 const controller = event.target;
@@ -456,19 +470,16 @@
                     // Update physics body to drop location
                     potBody.position.copy(potGroup.position);
                     potBody.quaternion.copy(potGroup.quaternion);
-                    world.addBody(potBody);
 
                     // Impart throw velocity
                     const v = getControllerVelocity(controller);
                     // Multiply velocity to make throwing in VR feel more natural/powerful
-                    potBody.velocity.set(v.x * 1.8, v.y * 1.8, v.z * 1.8);
+                    potBody.velocity.set(v.x * 2.0, v.y * 2.0, v.z * 2.0);
                     
-                    // Random spin
-                    potBody.angularVelocity.set(
-                        (Math.random()-0.5)*10,
-                        (Math.random()-0.5)*10,
-                        (Math.random()-0.5)*10
-                    );
+                    // Natural spin based on throw direction
+                    potBody.angularVelocity.set(v.z * 5, (Math.random()-0.5)*5, -v.x * 5);
+                    
+                    world.addBody(potBody);
                 }
             };
 
@@ -485,29 +496,29 @@
         }
 
         // Keep track of controller speeds for throwing
-        function updateControllersVelocity(dt) {
+        function updateControllersVelocity() {
+            const now = performance.now();
             [controller1, controller2].forEach(c => {
                 if(!c) return;
                 if(!controllersData.has(c)) {
-                    controllersData.set(c, { positions: [], velocities: [] });
+                    const initPos = new THREE.Vector3();
+                    c.getWorldPosition(initPos);
+                    controllersData.set(c, { velocities: [], lastPos: initPos, lastTime: now });
                 }
                 const data = controllersData.get(c);
                 const pos = new THREE.Vector3();
                 c.getWorldPosition(pos);
                 
-                if(data.positions.length > 0) {
-                    const lastPos = data.positions[data.positions.length - 1];
-                    // Prevent division by zero
-                    if(dt > 0) {
-                        const v = new THREE.Vector3().subVectors(pos, lastPos).divideScalar(dt);
-                        data.velocities.push(v);
-                    }
+                const dt = (now - data.lastTime) / 1000;
+                if(dt > 0.005) { // 少なくとも5ms経過してから速度更新（XR特有の微小ブレ防止）
+                    const v = new THREE.Vector3().subVectors(pos, data.lastPos).divideScalar(dt);
+                    data.velocities.push({v: v, t: now});
+                    data.lastPos.copy(pos);
+                    data.lastTime = now;
                 }
-                data.positions.push(pos);
                 
-                // Keep history small to calculate recent average
-                if(data.positions.length > 4) data.positions.shift();
-                if(data.velocities.length > 3) data.velocities.shift();
+                // 直近100ミリ秒間の移動平均を取り、フレーム落ちの影響を受けない滑らかなスローを実現
+                data.velocities = data.velocities.filter(item => now - item.t < 100);
             });
         }
 
@@ -515,7 +526,7 @@
             const data = controllersData.get(c);
             if(!data || data.velocities.length === 0) return new THREE.Vector3(0,0,0);
             const avg = new THREE.Vector3();
-            data.velocities.forEach(v => avg.add(v));
+            data.velocities.forEach(item => avg.add(item.v));
             avg.divideScalar(data.velocities.length);
             return avg;
         }
@@ -681,37 +692,56 @@
             if(!audioCtx || audioCtx.state !== 'running') return;
             const t = audioCtx.currentTime;
 
-            // 1. Bass Thump (Impact)
-            const osc = audioCtx.createOscillator();
-            osc.type = 'triangle';
-            osc.frequency.setValueAtTime(100, t);
-            osc.frequency.exponentialRampToValueAtTime(20, t + 0.15);
-            const gainOsc = audioCtx.createGain();
-            gainOsc.gain.setValueAtTime(1.5, t);
-            gainOsc.gain.exponentialRampToValueAtTime(0.01, t + 0.15);
-            osc.connect(gainOsc).connect(audioCtx.destination);
-            osc.start(t);
-            osc.stop(t + 0.15);
+            // 1. Initial Impact (Thud) - 低音の衝撃音
+            const oscThud = audioCtx.createOscillator();
+            const gainThud = audioCtx.createGain();
+            oscThud.type = 'sine';
+            oscThud.frequency.setValueAtTime(150, t);
+            oscThud.frequency.exponentialRampToValueAtTime(30, t + 0.1);
+            gainThud.gain.setValueAtTime(1.5, t);
+            gainThud.gain.exponentialRampToValueAtTime(0.01, t + 0.1);
+            oscThud.connect(gainThud).connect(audioCtx.destination);
+            oscThud.start(t);
+            oscThud.stop(t + 0.1);
 
-            // 2. High Frequency Crash Noise (Ceramic Breaking)
-            const bufferSize = audioCtx.sampleRate * 0.6; // 0.6 seconds
+            // 2. Ceramic Pings - 陶器特有の非整数倍音（物理モデリング）
+            const freqs = [1200, 2450, 3120, 4800, 6500, 8200];
+            freqs.forEach((freq, i) => {
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = i % 2 === 0 ? 'sine' : 'triangle';
+                
+                // 割れた瞬間の微小なピッチダウンで金属ではなく「土」の硬さを表現
+                osc.frequency.setValueAtTime(freq, t);
+                osc.frequency.exponentialRampToValueAtTime(freq * 0.95, t + 0.3);
+                
+                // 非常に鋭いアタック（打撃）と不規則な減衰
+                gain.gain.setValueAtTime(0, t);
+                gain.gain.linearRampToValueAtTime(0.8 / freqs.length, t + 0.005);
+                gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1 + Math.random() * 0.25);
+                
+                osc.connect(gain).connect(audioCtx.destination);
+                osc.start(t);
+                osc.stop(t + 0.4);
+            });
+
+            // 3. Debris/Crackle Noise - 破片や土が散らばる高周波ノイズ
+            const bufferSize = audioCtx.sampleRate * 0.4;
             const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
             const data = buffer.getChannelData(0);
             for(let i = 0; i < bufferSize; i++) {
-                // Exponential decay on noise envelope
-                data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.08));
+                data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (audioCtx.sampleRate * 0.06));
             }
             const noise = audioCtx.createBufferSource();
             noise.buffer = buffer;
             
-            // Filter out low end of noise
             const filter = audioCtx.createBiquadFilter();
             filter.type = 'highpass';
-            filter.frequency.value = 1200;
+            filter.frequency.value = 1500;
             
             const gainNoise = audioCtx.createGain();
-            gainNoise.gain.setValueAtTime(1.2, t);
-            gainNoise.gain.exponentialRampToValueAtTime(0.01, t + 0.5);
+            gainNoise.gain.setValueAtTime(1.0, t);
+            gainNoise.gain.exponentialRampToValueAtTime(0.01, t + 0.4);
             
             noise.connect(filter).connect(gainNoise).connect(audioCtx.destination);
             noise.start(t);
@@ -745,7 +775,7 @@
             world.step(1 / 60, dt, 3);
 
             // Update hand velocities
-            updateControllersVelocity(dt);
+            updateControllersVelocity();
 
             // Synchronize Three.js visual objects with Cannon.js bodies
             if(grabbedBy && !isBroken) {
