@@ -226,30 +226,29 @@
             soilMesh.position.y = 0.08;
             potGroup.add(soilMesh);
 
-            // Procedural Plant Shape
+            // Procedural Plant Shape (Realistic Succulent/Sansevieria style)
             plantGroup = new THREE.Group();
-            const stemGeo = new THREE.CylinderGeometry(0.01, 0.01, 0.2);
-            const plantMat = new THREE.MeshStandardMaterial({ color: 0x228B22, roughness: 0.8 });
-            const stem = new THREE.Mesh(stemGeo, plantMat);
-            stem.position.y = 0.1;
-            plantGroup.add(stem);
-
-            const leafGeo = new THREE.SphereGeometry(0.08, 8, 8);
-            leafGeo.scale(1, 0.2, 1); // Flatten for leaf shape
-            const leaf1 = new THREE.Mesh(leafGeo, plantMat);
-            leaf1.position.set(0.05, 0.15, 0);
-            leaf1.rotation.z = -Math.PI/6;
-            plantGroup.add(leaf1);
-            
-            const leaf2 = new THREE.Mesh(leafGeo, plantMat);
-            leaf2.position.set(-0.05, 0.12, 0);
-            leaf2.rotation.z = Math.PI/6;
-            plantGroup.add(leaf2);
-
-            const leaf3 = new THREE.Mesh(leafGeo, plantMat);
-            leaf3.position.set(0, 0.18, 0.05);
-            leaf3.rotation.x = Math.PI/6;
-            plantGroup.add(leaf3);
+            const plantMat = new THREE.MeshStandardMaterial({ color: 0x3b5e2b, roughness: 0.9 }); // 深い緑
+            const numLeaves = 8;
+            for (let i = 0; i < numLeaves; i++) {
+                const h = 0.15 + Math.random() * 0.15;
+                // 先端が細く根本が太い円錐をベースにする
+                const leafGeo = new THREE.CylinderGeometry(0, 0.025, h, 6);
+                leafGeo.scale(1, 1, 0.2); // Z軸を潰して平べったい「葉」の形にする
+                leafGeo.translate(0, h / 2, 0); // 回転軸を葉の根本（下端）にずらす
+                
+                const leaf = new THREE.Mesh(leafGeo, plantMat);
+                
+                // 放射状に配置
+                const angle = (i / numLeaves) * Math.PI * 2 + (Math.random() * 0.5);
+                leaf.rotation.y = angle;
+                // 外側に向かって少し倒す
+                leaf.rotation.x = 0.15 + Math.random() * 0.3; 
+                
+                // 根本を中心からわずかに散らす
+                leaf.position.set(Math.sin(angle) * 0.02, 0, Math.cos(angle) * 0.02);
+                plantGroup.add(leaf);
+            }
 
             plantGroup.position.y = 0.1; 
             potGroup.add(plantGroup);
@@ -366,7 +365,10 @@
             // 1. Generate Ceramic Debris
             for (let i = 0; i < 12; i++) {
                 const s = 0.05 + Math.random() * 0.05;
-                const geo = new THREE.BoxGeometry(s, s, s);
+                // 立方体ではなく、四面体を不規則に歪ませて「鋭利な陶器の破片」を表現
+                const geo = new THREE.TetrahedronGeometry(s);
+                geo.scale(1 + Math.random(), 0.3 + Math.random() * 0.4, 1 + Math.random());
+                
                 const mesh = new THREE.Mesh(geo, ceramicMat);
                 mesh.castShadow = true;
                 
@@ -397,7 +399,10 @@
             // 2. Generate Soil Debris
             for (let i = 0; i < 20; i++) {
                 const s = 0.02 + Math.random() * 0.03;
-                const geo = new THREE.BoxGeometry(s, s, s);
+                // 立方体ではなく、十二面体を少し潰して「ゴツゴツした土塊」を表現
+                const geo = new THREE.DodecahedronGeometry(s * 0.8);
+                geo.scale(1, 0.8 + Math.random() * 0.4, 1);
+
                 const mesh = new THREE.Mesh(geo, soilMat);
                 mesh.castShadow = true;
                 
